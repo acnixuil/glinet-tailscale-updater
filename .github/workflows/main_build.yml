@@ -1,4 +1,4 @@
-name: Build smaller Tailscale binary
+name: Build no_upx binary
 on:
   workflow_dispatch:
     inputs:
@@ -9,7 +9,7 @@ on:
       force_build:
         description: 'Force build even if versions match'
         required: false
-        default: false
+        default: true
         type: boolean
   schedule:
     - cron: '0 3 * * *'
