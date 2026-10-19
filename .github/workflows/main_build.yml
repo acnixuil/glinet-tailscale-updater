@@ -1,4 +1,4 @@
-name: Build smaller Tailscale binary
+name: Build no_upx binary
 on:
   workflow_dispatch:
     inputs:
