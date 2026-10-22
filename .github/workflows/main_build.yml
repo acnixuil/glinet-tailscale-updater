@@ -1,4 +1,4 @@
-name: Build no_upx binary
+name: Build upx binary
 on:
   workflow_dispatch:
     inputs:
@@ -108,6 +108,11 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go-version }}
+      - name: Setup UPX
+        run: |
+          wget https://github.com/upx/upx/releases/download/v3.95/upx-3.95-amd64_linux.tar.xz
+          tar xf upx-3.95-amd64_linux.tar.xz
+          echo "UPX=${{ github.workspace }}/upx-3.95-amd64_linux/upx" >> $GITHUB_ENV
       - name: Download Go modules
         run: go mod download
       - name: Verify GL.iNet patch invariants
@@ -136,14 +141,14 @@ jobs:
           echo "Original Tailscale version: ${VERSION_SHORT}"
           echo "Custom build version: ${VERSION_SHORT_CUSTOM}"
           # Prepare feature set for smaller binary
-          # 1. CORE & NETWORKING                                             
+          # 1. CORE & NETWORKING                                                         
           KEEP="dns,osrouter,iptables,netstack,health,logtail,portmapper,usermetrics,useroutes,cli"
           # 2. ROUTING & NODES
-          KEEP="${KEEP},advertiseexitnode,useexitnode,advertiseroutes"                           
+          KEEP="${KEEP},advertiseexitnode,useexitnode,advertiseroutes"                            
           KEEP="${KEEP},clientmetrics,cliconndiag,doctor"
           # 4. SECURITY & AUTH
           KEEP="${KEEP},acme,bakedroots,tailnetlock,unixsocketidentity"
-          # 5. EXTRA                                         
+          # 5. EXTRA                                            
           KEEP="${KEEP},appconnectors,cachenetmap,colorable,conn25,debug,gro,ipnbus"        
           KEEP="${KEEP},hujsonconf,lazywg,listenrawdisco,portlist,serve,ssh,useproxy,relayserver"
           # Finalize build tags
@@ -155,6 +160,10 @@ jobs:
           CGO_ENABLED=0 GOOS=${{ matrix.os }} GOARCH=${{ matrix.platform }} \
           go build -tags="${BUILD_TAGS}" -trimpath -ldflags "${LDFLAGS}" \
           -o "${{ env.FILE_NAME }}-${{ matrix.os }}-${{ matrix.platform }}" tailscale.com/cmd/${{ env.FILE_NAME }}
+
+          # Use UPX to compress the binary
+          chmod +x "${{ env.FILE_NAME }}-${{ matrix.os }}-${{ matrix.platform }}"
+          ${UPX} --lzma --best "${{ env.FILE_NAME }}-${{ matrix.os }}-${{ matrix.platform }}" || true
 
           echo "${VERSION_SHORT_CUSTOM}" > "version.txt"
       - name: Upload built binary
