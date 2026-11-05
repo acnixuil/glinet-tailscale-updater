@@ -1,0 +1,226 @@
+name: Build tiny Tailscale (no UPX)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Tailscale 版本 tag，例如 v1.104.5；留空则用上游最新'
+        required: false
+        type: string
+      force_build:
+        description: '版本号相同也强制重建'
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: '0 4 * * *'
+
+env:
+  SOFTWARE_NAME: "Tailscale"
+  FILE_NAME: "tailscaled"
+  REPO: "tailscale/tailscale"
+  RELEASE_TAG: "tiny-noupx"
+
+jobs:
+  check-versions:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      TAG: ${{ steps.tag.outputs.TAG }}
+      CURRENT: ${{ steps.current.outputs.CURRENT }}
+      SHOULD_BUILD: ${{ steps.compare.outputs.SHOULD_BUILD }}
+    steps:
+      - name: 取 Tailscale 版本号
+        id: tag
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            latest_tag="${{ inputs.version }}"
+            echo "使用指定版本：${latest_tag}"
+          else
+            latest_tag=$(curl -s "https://api.github.com/repos/${{ env.REPO }}/releases/latest" | jq -r '.tag_name // empty')
+            echo "上游最新版本：${latest_tag}"
+          fi
+          if [ -z "$latest_tag" ]; then
+            echo "::error::取不到 Tailscale 版本号"
+            exit 1
+          fi
+          echo "TAG=${latest_tag}" >> "$GITHUB_OUTPUT"
+
+      - name: 读已发布版本
+        id: current
+        run: |
+          current=$(curl -fsSL "https://github.com/${{ github.repository }}/releases/download/${{ env.RELEASE_TAG }}/version.txt" | sed -n '1s/[[:space:]]*$//p' | head -n 1)
+          echo "当前已发布：${current:-无}"
+          echo "CURRENT=${current}" >> "$GITHUB_OUTPUT"
+
+      - name: 判断是否需要构建
+        id: compare
+        run: |
+          if [ "${{ steps.tag.outputs.TAG }}" = "${{ steps.current.outputs.CURRENT }}" ]; then
+            echo "SHOULD_BUILD=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "SHOULD_BUILD=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check-versions
+    if: needs.check-versions.outputs.SHOULD_BUILD == 'true' || (github.event_name == 'workflow_dispatch' && (inputs.force_build || inputs.version != ''))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        platform:
+          - amd64
+          - arm64
+    env:
+      TAG: ${{ needs.check-versions.outputs.TAG }}
+    steps:
+      - name: 检出 Tailscale 源码
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.REPO }}
+          ref: ${{ env.TAG }}
+
+      - name: 检出本仓库补丁
+        uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - name: 应用 GL.iNet 补丁
+        env:
+          TAILSCALE_TAG: ${{ env.TAG }}
+        run: repo/scripts/apply-tailscale-patches.sh --patch-dir repo/patches --source-dir .
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: 下载 Go 依赖
+        run: go mod download
+
+      - name: 校验补丁不变量
+        if: matrix.platform == 'amd64'
+        run: |
+          cp repo/patches/verify/gl_invariants_test.go util/linuxfw/zz_gl_invariants_test.go
+          go test ./util/linuxfw/ -run TestGLPatchInvariants -v
+          rm util/linuxfw/zz_gl_invariants_test.go
+
+      - name: 交叉编译
+        run: |
+          eval `CGO_ENABLED=0 go run ./cmd/mkversion`
+
+          if [ -n "${GITHUB_RUN_NUMBER}" ]; then
+            CUSTOM_BUILD_NUMBER="${GITHUB_RUN_NUMBER}"
+          else
+            CUSTOM_BUILD_NUMBER="$(date +%s)"
+          fi
+          CUSTOM_VERSION_SUFFIX="-tiny.noupx.${CUSTOM_BUILD_NUMBER}"
+
+          VERSION_SHORT_CUSTOM="${VERSION_SHORT}${CUSTOM_VERSION_SUFFIX}"
+          VERSION_LONG_CUSTOM="${VERSION_LONG}${CUSTOM_VERSION_SUFFIX}"
+
+          echo "上游版本：${VERSION_SHORT}"
+          echo "构建版本：${VERSION_SHORT_CUSTOM}"
+
+          KEEP="dns,osrouter,iptables,netstack,health,logtail,portmapper,usermetrics,useroutes,cli"
+          KEEP="${KEEP},advertiseexitnode,useexitnode,advertiseroutes"
+          KEEP="${KEEP},clientmetrics,cliconndiag,doctor"
+          KEEP="${KEEP},acme,bakedroots,tailnetlock,unixsocketidentity"
+          KEEP="${KEEP},appconnectors,cachenetmap,colorable,conn25,debug,gro,ipnbus"
+          KEEP="${KEEP},hujsonconf,lazywg,listenrawdisco,portlist,serve,ssh,useproxy,relayserver"
+
+          BUILD_TAGS=$(go run ./cmd/featuretags --min --add="${KEEP}")
+
+          LDFLAGS="-w -s -X tailscale.com/version.longStamp=${VERSION_LONG_CUSTOM} -X tailscale.com/version.shortStamp=${VERSION_SHORT_CUSTOM}"
+
+          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.platform }} go build -tags="${BUILD_TAGS}" -trimpath -ldflags "${LDFLAGS}" -o "${FILE_NAME}-linux-${{ matrix.platform }}" tailscale.com/cmd/${FILE_NAME}
+
+          ls -l "${FILE_NAME}-linux-${{ matrix.platform }}"
+
+      - name: 上传二进制
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.FILE_NAME }}-${{ matrix.platform }}
+          path: ./${{ env.FILE_NAME }}-linux-${{ matrix.platform }}
+          if-no-files-found: error
+
+      - name: 写版本文件
+        if: matrix.platform == 'amd64'
+        run: echo "${TAG}" > version.txt
+
+      - name: 上传版本文件
+        if: matrix.platform == 'amd64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: version-file
+          path: ./version.txt
+
+  publish:
+    needs:
+      - build
+      - check-versions
+    if: needs.check-versions.outputs.SHOULD_BUILD == 'true' || (github.event_name == 'workflow_dispatch' && (inputs.force_build || inputs.version != ''))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: 下载构建产物
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ env.FILE_NAME }}-*
+
+      - name: 下载版本文件
+        uses: actions/download-artifact@v4
+        with:
+          name: version-file
+          path: .
+
+      - name: 展平目录
+        run: |
+          for dir in "${FILE_NAME}-"*; do
+            if [ -d "$dir" ]; then
+              mv -v "$dir" "${dir}.d"
+              mv -v "${dir}.d/"* .
+              rmdir -v "${dir}.d"
+            fi
+          done
+          chmod -v +x "${FILE_NAME}-linux-"*
+          ls -l "${FILE_NAME}-linux-"*
+
+      - name: 生成校验和
+        run: sha256sum "${FILE_NAME}-linux-"* > checksums.txt
+
+      - name: 发布 Release
+        uses: ncipollo/release-action@v1
+        with:
+          name: Tiny ${{ env.SOFTWARE_NAME }} ${{ needs.check-versions.outputs.TAG }} (no UPX)
+          tag: ${{ env.RELEASE_TAG }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          draft: false
+          prerelease: true
+          removeArtifacts: true
+          replacesArtifacts: true
+          allowUpdates: true
+          artifacts: |
+            tailscaled-linux-*
+            checksums.txt
+            version.txt
+          body: |
+            Tiny Tailscale build ${{ needs.check-versions.outputs.TAG }}, no UPX.
+
+            Same feature set and GL.iNet patches as the tiny build, compiled for amd64 and arm64 only, shipped as plain uncompressed binaries.
+
+            Assets:
+
+            * `tailscaled-linux-amd64`
+            * `tailscaled-linux-arm64`
+            * `checksums.txt`
+            * `version.txt` records the upstream Tailscale tag this release was built from
+
+            The binary is a combined `tailscaled` plus `tailscale` CLI build. Install it as `tailscaled` and create a symlink `tailscale` pointing at it.
+
+            For the full changelog see https://github.com/tailscale/tailscale/releases/tag/${{ needs.check-versions.outputs.TAG }}
